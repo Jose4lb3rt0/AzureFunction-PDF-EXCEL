@@ -11,7 +11,7 @@ using System.Data.SqlClient;
 using iTextSharp.text;
 using iTextSharp.text.pdf;
 using Azure.Storage.Blobs;
-using Azure.Storage.Blobs.Models; 
+using Azure.Storage.Blobs.Models;
 
 namespace FunctionApp1
 {
@@ -19,21 +19,47 @@ namespace FunctionApp1
     {
         [FunctionName("Function1")]
         public static async Task<IActionResult> Run(
-            [HttpTrigger(AuthorizationLevel.Function, "get", "post", Route = null)] HttpRequest req,
+            [HttpTrigger(AuthorizationLevel.Anonymous, "get", "post", Route = null)] HttpRequest req,
             ILogger log)
         {
             log.LogInformation("C# HTTP trigger function processed a request.");
 
-            // Poniendole las cadenas de conexión
+            // OBTENCIÓN DE PARÁMETROS
+            string startDateStr = req.Query["startDate"];
+            string endDateStr = req.Query["endDate"];
+
+            DateTime startDate;
+            DateTime endDate;
+
+            if (string.IsNullOrEmpty(startDateStr) || string.IsNullOrEmpty(endDateStr) ||
+                !DateTime.TryParse(startDateStr, out startDate) ||
+                !DateTime.TryParse(endDateStr, out endDate))
+            {
+                return new BadRequestObjectResult("Proporcione parámetros válidos ?startDate='yyyy-mm-dd' y &endDate='yyyy-mm-dd'.");
+            }
+
+            // Poniendo las cadenas de conexión de local.settings.json
             string connectionString = Environment.GetEnvironmentVariable("SqlCS");
             string blobConnectionString = Environment.GetEnvironmentVariable("BsCS");
 
             using (SqlConnection conn = new SqlConnection(connectionString))
             {
                 await conn.OpenAsync();
-                // Acá va la consulta
-                var query = "SELECT * FROM dbo.Ventas";
+
+                // Consulta SQL con cláusula BETWEEN
+                var query = @"
+                    SELECT v.venta_id, v.cliente_id, v.vendedor_id, v.producto_id, v.cantidad, v.precio_unitario, v.fecha_venta, 
+                           c.nombre AS cliente_nombre, p.nombre AS producto_nombre, vdr.nombre AS vendedor_nombre
+                    FROM dbo.Ventas v
+                    INNER JOIN dbo.Clientes c ON v.cliente_id = c.clientes_id
+                    INNER JOIN dbo.Productos p ON v.producto_id = p.id
+                    INNER JOIN dbo.Vendedores vdr ON v.vendedor_id = vdr.vendedor_id
+                    WHERE v.fecha_venta BETWEEN @startDate AND @endDate";
+
                 SqlCommand cmd = new SqlCommand(query, conn);
+                cmd.Parameters.AddWithValue("@startDate", startDate);
+                cmd.Parameters.AddWithValue("@endDate", endDate);
+
                 SqlDataReader reader = await cmd.ExecuteReaderAsync();
 
                 //------------------------PDF------------------------
@@ -43,22 +69,38 @@ namespace FunctionApp1
                     PdfWriter writer = PdfWriter.GetInstance(pdfDoc, memoryStream);
                     pdfDoc.Open();
 
-                    // PDF IMPRESIÓN DEL CONTENIDO
-                    pdfDoc.Add(new Paragraph("Datos de la Base de Datos"));
-                    pdfDoc.Add(new Paragraph(" "));
+                    //ARQUITECTURA DE LA TABLA
+                    PdfPTable table = new PdfPTable(10);
+                    table.WidthPercentage = 100;
+                    table.SetWidths(new float[] { 1f, 1.5f, 1f, 1.5f, 1f, 1.5f, 1f, 1f, 1f, 1.5f }); 
+                    //CABECERA DE LA TABLA
+                    string[] headers = { "Venta ID", "Cliente ID", "Cliente Nombre", "Vendedor ID", "Vendedor Nombre", "Producto ID", "Producto Nombre", "Cantidad", "Precio Unitario", "Fecha de Venta" };
+                    foreach (var header in headers)
+                    {
+                        PdfPCell cell = new PdfPCell(new Phrase(header, FontFactory.GetFont(FontFactory.HELVETICA_BOLD, 12f, BaseColor.WHITE)));
+                        cell.BackgroundColor = BaseColor.DARK_GRAY;
+                        cell.HorizontalAlignment = Element.ALIGN_CENTER;
+                        cell.Padding = 5;
+                        table.AddCell(cell);
+                    }
+
+                    // FILAS DE LA TABLA
                     while (await reader.ReadAsync())
                     {
-                        // LECTURA A PARTIR DE LAS COLUMNAS DE LA TABLA
-                        string venta_id = reader["venta_id"].ToString();
-                        string cliente_id = reader["cliente_id"].ToString();
-                        string vendedor_id = reader["vendedor_id"].ToString();
-                        string producto_id = reader["producto_id"].ToString();
-                        string cantidad = reader["cantidad"].ToString();
-                        string precio_unitario = reader["precio_unitario"].ToString();
-                        string fecha_venta = reader["fecha_venta"].ToString();
-                        pdfDoc.Add(new Paragraph($"Venta ID: {venta_id}, Cliente ID: {cliente_id}, Vendedor ID: {vendedor_id}, Producto ID: {producto_id}, Cantidad: {cantidad}, Precio Unitario: {precio_unitario}, Fecha de Venta: {fecha_venta}"));
+                        table.AddCell(CreateCell(reader["venta_id"].ToString()));
+                        table.AddCell(CreateCell(reader["cliente_id"].ToString()));
+                        table.AddCell(CreateCell(reader["cliente_nombre"].ToString()));
+                        table.AddCell(CreateCell(reader["vendedor_id"].ToString()));
+                        table.AddCell(CreateCell(reader["vendedor_nombre"].ToString()));
+                        table.AddCell(CreateCell(reader["producto_id"].ToString()));
+                        table.AddCell(CreateCell(reader["producto_nombre"].ToString()));
+                        table.AddCell(CreateCell(reader["cantidad"].ToString()));
+                        table.AddCell(CreateCell(reader["precio_unitario"].ToString()));
+                        table.AddCell(CreateCell(reader["fecha_venta"].ToString()));
                     }
-                     pdfDoc.Close();
+
+                    pdfDoc.Add(table);
+                    pdfDoc.Close();
                     byte[] pdfBytes = memoryStream.ToArray();
                     memoryStream.Close();
                 //---------------------------------------------------
@@ -72,14 +114,26 @@ namespace FunctionApp1
                 string fileName = $"output-{DateTime.UtcNow.ToString("yyyyMMddHHmmss")}.pdf";
                 BlobClient blobClient = containerClient.GetBlobClient(fileName);
 
-                //SUBIDA
+                // SUBIDA
                 using (MemoryStream uploadStream = new MemoryStream(pdfBytes))
                 {
                     await blobClient.UploadAsync(uploadStream, true);
                 }
             }
-            //RESPUESTA DE LA FUNCIÓN POR EL LOCALHOST
+
+            // RESPUESTA DE LA FUNCIÓN POR EL LOCALHOST
             return new OkObjectResult("PDF generado y guardado en Blob Storage exitosamente.");
+        }
+
+        // crear celdas con estilo
+        private static PdfPCell CreateCell(string text)
+        {
+            PdfPCell cell = new PdfPCell(new Phrase(text, FontFactory.GetFont(FontFactory.HELVETICA, 10f)));
+            cell.HorizontalAlignment = Element.ALIGN_CENTER;
+            cell.VerticalAlignment = Element.ALIGN_MIDDLE;
+            cell.Padding = 5;
+            cell.BorderWidth = 0.5f;
+            return cell;
         }
     }
 }
